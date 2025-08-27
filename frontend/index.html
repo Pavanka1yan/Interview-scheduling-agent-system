@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Interview Scheduling AI</title>
+  <script>
+    async function loadMessage() {
+      try {
+        const response = await fetch('http://localhost:8000/');
+        const data = await response.json();
+        document.getElementById('message').textContent = data.message;
+      } catch (e) {
+        console.error(e);
+      }
+    }
+    window.onload = loadMessage;
+  </script>
+</head>
+<body>
+  <h1 id="message">Loading...</h1>
+</body>
+</html>
