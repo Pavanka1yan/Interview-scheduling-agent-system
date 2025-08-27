@@ -1,0 +1,11 @@
+{
+  "name": "interview-scheduling-agent-system",
+  "version": "1.0.0",
+  "scripts": {
+    "dev": "echo 'Starting dev server (placeholder)'",
+    "test": "echo 'Running tests (placeholder)'",
+    "lint": "echo 'Linting (placeholder)'",
+    "seed": "echo 'Seeding data (placeholder)'",
+    "build": "echo 'Building project (placeholder)'"
+  }
+}
