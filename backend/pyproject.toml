@@ -1,0 +1,16 @@
+[project]
+name = "interview-backend"
+version = "0.1.0"
+description = "Interview scheduling backend service"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi",
+    "uvicorn",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["app"]
+testpaths = ["tests"]
+
+[tool.flake8]
+max-line-length = 88
