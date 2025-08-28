@@ -1,1 +1,258 @@
---
+[
+  {
+    "id": "INIT-1",
+    "title": "Initialize monorepo",
+    "summary": "Create a mono-repo with backend (Python) and frontend (React) workspaces, plus ops folder. Configure shared editor settings and lint.",
+    "files_to_create": "{'README.md': 'Project overview and quickstart. Summarize backend (agentic LangGraph service) and frontend (admin-only React) and ops.', 'backend/README.md': 'How to run backend locally; describe env vars and dev workflows.', 'frontend/README.md': 'How to run admin SPA locally.', 'ops/README.md': 'Containers, compose, and deployment notes.', '.editorconfig': 'Standard indentation and line endings.', '.gitignore': 'Ignore venv/node_modules/dist/build/.env/*.db/*.pyc etc.'}",
+    "dependencies": [],
+    "definition_of_done": "['All files created/updated', 'Unit tests (if any) compile and pass', 'Lint passes', 'Local smoke run works for this feature']"
+  },
+  {
+    "id": "INIT-2",
+    "title": "Developer scripts",
+    "summary": "Provide Makefile/npm scripts to run dev servers, tests, lint, and seed data.",
+    "files_to_create": "{'Makefile': '# Provide common developer commands\\n# make dev, make test, make lint, make seed, make build\\n', 'CONTRIBUTING.md': 'Explain branch naming, commit message style, and PR checks.'}",
+    "dependencies": "['INIT-1']",
+    "definition_of_done": "['All files created/updated', 'Unit tests (if any) compile and pass', 'Lint passes', 'Local smoke run works for this feature']"
+  },
+  {
+    "id": "BE-1",
+    "title": "Backend scaffold",
+    "summary": "Scaffold a web service (FastAPI-style) with modular app layout. No business code yet, just boot, health, config loader.",
+    "files_to_create": "{'backend/app/__init__.py': 'empty', 'backend/app/main.py': \"Create app object, register health route GET /health returning {status:'ok'}.\", 'backend/app/core/config.py': 'Load settings from env: DATABASE_URL, PROVIDERS, LOG_LEVEL, TZ default Asia/Kolkata.', 'backend/app/core/logging.py': 'JSON structured logger, request ID middleware.', 'backend/app/api/__init__.py': 'router aggregator', 'backend/app/api/health.py': 'router for /health', 'backend/pyproject.toml': 'Project metadata and dependencies placeholders', 'backend/tests/test_health.py': 'Ping /health and assert ok'}",
+    "dependencies": "['INIT-1']",
+    "definition_of_done": "['All files created/updated', 'Unit tests (if any) compile and pass', 'Lint passes', 'Local smoke run works for this feature']"
+  },
+  {
+    "id": "BE-2",
+    "title": "Domain models (dataclasses)",
+    "summary": "Define dataclasses/Pydantic models for Org, User, Candidate, Interview, Panelist, Holiday, CalendarAccount, CalendarEvent, Message, RunMeta.",
+    "files_to_create": "{'backend/app/domain/models.py': 'Define immutable types and their fields; include docstrings and examples.', 'backend/app/domain/schemas.py': 'API-facing request/response schemas (DTOs).', 'backend/tests/test_models_compile.py': 'Smoke test: import modules and instantiate sample objects.'}",
+    "dependencies": "['BE-1']",
+    "definition_of_done": "['All files created/updated', 'Unit tests (if any) compile and pass', 'Lint passes', 'Local smoke run works for this feature']"
+  },
+  {
+    "id": "BE-3",
+    "title": "Persistence schema",
+    "summary": "Create DB schema layer (ORM or SQL file) with tables for core entities and a messages log. Include migrations.",
+    "files_to_create": "{'backend/app/db/base.py': 'DB session/bootstrap helpers.', 'backend/app/db/schema.sql': 'DDL for tables as per ERD.', 'backend/app/db/seed.py': 'Seed panelists, holidays, message templates.', 'backend/tests/test_schema_sql_parses.py': 'Parse schema SQL to ensure no syntax errors.'}",
+    "dependencies": "['BE-2']",
+    "definition_of_done": "['All files created/updated', 'Unit tests (if any) compile and pass', 'Lint passes', 'Local smoke run works for this feature']"
+  },
+  {
+    "id": "BE-4",
+    "title": "Observability foundation",
+    "summary": "Add request/trace correlation IDs and basic counters for requests.",
+    "files_to_create": "{'backend/app/core/telemetry.py': 'Trace/span helpers and middleware.', 'backend/tests/test_telemetry_loads.py': 'Import and initialize telemetry without errors.'}",
+    "dependencies": "['BE-1']",
+    "definition_of_done": "['All files created/updated', 'Unit tests (if any) compile and pass', 'Lint passes', 'Local smoke run works for this feature']"
+  },
+  {
+    "id": "PLUG-1",
+    "title": "Calendar adapter contract",
+    "summary": "Create a provider-agnostic interface for calendars and in-memory fake implementation for tests.",
+    "files_to_create": "{'backend/app/plugins/calendars/base.py': 'Protocol with list_busy, create_event, cancel_event; exceptions and types.', 'backend/app/plugins/calendars/fake.py': 'In-memory adapter for tests (stores busy slots & created events).', 'backend/tests/plugins/test_calendar_fake.py': 'Ensure busy merge and create/cancel works.'}",
+    "dependencies": "['BE-2']",
+    "definition_of_done": "['All files created/updated', 'Unit tests (if any) compile and pass', 'Lint passes', 'Local smoke run works for this feature']"
+  },
+  {
+    "id": "PLUG-2",
+    "title": "Comms channel contract",
+    "summary": "Create outbound send_message interface and inbound normalization contract. Provide a fake channel for tests.",
+    "files_to_create": "{'backend/app/plugins/comms/base.py': 'Protocol for send_message(to, subject, body_text, body_html, metadata).', 'backend/app/plugins/comms/fake.py': 'Stores outbound messages; returns deterministic external_id.', 'backend/app/inbox/normalizer.py': 'Function normalize_inbound(provider_payload)->Message dto.', 'backend/tests/plugins/test_comms_fake.py': 'Assert send_message stored and idempotent.'}",
+    "dependencies": "['BE-2']",
+    "definition_of_done": "['All files created/updated', 'Unit tests (if any) compile and pass', 'Lint passes', 'Local smoke run works for this feature']"
+  },
+  {
+    "id": "PLUG-3",
+    "title": "Holiday & slot strategy contracts",
+    "summary": "Add holiday provider and slot strategy interfaces with fakes.",
+    "files_to_create": "{'backend/app/plugins/holidays/base.py': 'Protocol with is_holiday(date, region) and list_holidays(year, region).', 'backend/app/plugins/holidays/fake.py': 'Simple fixed holiday list.', 'backend/app/plugins/slots/base.py': 'Protocol propose(candidate_tz, panelists, duration, window, constraints)->slots.', 'backend/app/plugins/slots/fake.py': 'Generate 3 deterministic slots for tests.'}",
+    "dependencies": "['BE-2']",
+    "definition_of_done": "['All files created/updated', 'Unit tests (if any) compile and pass', 'Lint passes', 'Local smoke run works for this feature']"
+  },
+  {
+    "id": "PLUG-4",
+    "title": "LLM provider interface",
+    "summary": "Define classify_reply and extract_slot with a rule-based fake implementation.",
+    "files_to_create": "{'backend/app/plugins/llm/base.py': 'Protocol with classify_reply(text)->label and extract_slot(text, proposed)->slot|None.', 'backend/app/plugins/llm/fake.py': 'Rule-based classifier (confirm/reschedule/reject/ask).'}",
+    "dependencies": "['BE-2']",
+    "definition_of_done": "['All files created/updated', 'Unit tests (if any) compile and pass', 'Lint passes', 'Local smoke run works for this feature']"
+  },
+  {
+    "id": "GRAPH-1",
+    "title": "State definition",
+    "summary": "Define the graph state type capturing everything needed to pause/resume.",
+    "files_to_create": "{'backend/app/graph/state.py': 'Typed state with fields: org_id, interview_id, candidate, panelists, duration_min, proposed_slots, awaiting, reply_text, decision, context, audit.'}",
+    "dependencies": "['PLUG-1', 'PLUG-2', 'PLUG-3', 'PLUG-4']",
+    "definition_of_done": "['All files created/updated', 'Unit tests (if any) compile and pass', 'Lint passes', 'Local smoke run works for this feature']"
+  },
+  {
+    "id": "GRAPH-2",
+    "title": "Nodes: propose_slots",
+    "summary": "Implement a node that calls SlotStrategy to compute candidate-facing suggestions, storing ISO strings in state.proposed_slots.",
+    "files_to_create": "{'backend/app/graph/nodes/propose_slots.py': 'Read panelists, holidays, duration; store top-N slots.'}",
+    "dependencies": "['GRAPH-1']",
+    "definition_of_done": "['All files created/updated', 'Unit tests (if any) compile and pass', 'Lint passes', 'Local smoke run works for this feature']"
+  },
+  {
+    "id": "GRAPH-3",
+    "title": "Nodes: send_invite + interrupt",
+    "summary": "Implement a node that renders a message from templates, uses CommsChannel to send, sets awaiting='candidate_reply', and INTERRUPTS waiting for reply.",
+    "files_to_create": "{'backend/app/graph/nodes/send_invite.py': \"Render invite with tokens; send via plugin; call interrupt('candidate_reply') and capture resume value.\"}",
+    "dependencies": "['GRAPH-2']",
+    "definition_of_done": "['All files created/updated', 'Unit tests (if any) compile and pass', 'Lint passes', 'Local smoke run works for this feature']"
+  },
+  {
+    "id": "GRAPH-4",
+    "title": "Nodes: decide",
+    "summary": "Implement a node that classifies reply_text via LLM provider to confirm/reschedule/reject/ask.",
+    "files_to_create": "{'backend/app/graph/nodes/decide.py': 'Set state.decision from plugin.'}",
+    "dependencies": "['GRAPH-3']",
+    "definition_of_done": "['All files created/updated', 'Unit tests (if any) compile and pass', 'Lint passes', 'Local smoke run works for this feature']"
+  },
+  {
+    "id": "GRAPH-5",
+    "title": "Nodes: schedule_or_loop",
+    "summary": "If confirm: extract selected slot, create calendar event, notify; if reschedule: compute alternates and goto send_invite; else: finalize.",
+    "files_to_create": "{'backend/app/graph/nodes/schedule_or_loop.py': 'Implements branching and goto back to send_invite on reschedule.'}",
+    "dependencies": "['GRAPH-4']",
+    "definition_of_done": "['All files created/updated', 'Unit tests (if any) compile and pass', 'Lint passes', 'Local smoke run works for this feature']"
+  },
+  {
+    "id": "GRAPH-6",
+    "title": "Graph assembly & checkpointer",
+    "summary": "Wire nodes into a StateGraph, add edges, compile with persistent checkpointer; expose a function to run/stream by thread_id.",
+    "files_to_create": "{'backend/app/graph/app.py': 'Build graph, compile with checkpointer; export app object with run/start helpers.'}",
+    "dependencies": "['GRAPH-2', 'GRAPH-3', 'GRAPH-4', 'GRAPH-5']",
+    "definition_of_done": "['All files created/updated', 'Unit tests (if any) compile and pass', 'Lint passes', 'Local smoke run works for this feature']"
+  },
+  {
+    "id": "API-1",
+    "title": "Inbox webhooks",
+    "summary": "Create inbound endpoints per channel that normalize payloads, persist Message, correlate to thread/interview, and resume the graph with the reply content.",
+    "files_to_create": "{'backend/app/api/inbox.py': 'POST endpoints for /inbox/email, /inbox/whatsapp etc; call resume(thread_id, reply_text).', 'backend/app/services/correlation.py': 'Extract thread_id from headers/subject/body markers with fallbacks.', 'backend/tests/test_inbox_resume.py': 'Simulate inbound payload and assert graph resumed.'}",
+    "dependencies": "['PLUG-2', 'GRAPH-6']",
+    "definition_of_done": "['All files created/updated', 'Unit tests (if any) compile and pass', 'Lint passes', 'Local smoke run works for this feature']"
+  },
+  {
+    "id": "API-2",
+    "title": "Runs API",
+    "summary": "CRUD-like endpoints to create a run for an interview, fetch run status, list runs by state, manual resume, and time-travel restore.",
+    "files_to_create": "{'backend/app/api/runs.py': 'Routes: POST /runs/start, GET /runs/:id, GET /runs?state=..., POST /runs/:id/resume, POST /runs/:id/restore.', 'backend/app/services/runs.py': 'Helpers to interact with graph/checkpoints.', 'backend/tests/test_runs_api.py': 'Start â interrupt â resume happy path.'}",
+    "dependencies": "['GRAPH-6']",
+    "definition_of_done": "['All files created/updated', 'Unit tests (if any) compile and pass', 'Lint passes', 'Local smoke run works for this feature']"
+  },
+  {
+    "id": "API-3",
+    "title": "Admin CRUD endpoints",
+    "summary": "Define endpoints to manage Candidates, Interviews, Panelists, Holidays, Calendars.",
+    "files_to_create": "{'backend/app/api/admin.py': 'CRUD routers for core entities with validation.', 'backend/tests/test_admin_crud.py': 'Create/update/list/delete smoke tests.'}",
+    "dependencies": "['BE-3']",
+    "definition_of_done": "['All files created/updated', 'Unit tests (if any) compile and pass', 'Lint passes', 'Local smoke run works for this feature']"
+  },
+  {
+    "id": "API-4",
+    "title": "Templates & settings endpoints",
+    "summary": "Endpoints to list/update templates, provider settings, and feature flags.",
+    "files_to_create": "{'backend/app/api/settings.py': 'GET/PUT routes for templates and configuration.', 'backend/tests/test_settings.py': 'Round-trip update tests.'}",
+    "dependencies": "['C4-1']",
+    "definition_of_done": "['All files created/updated', 'Unit tests (if any) compile and pass', 'Lint passes', 'Local smoke run works for this feature']"
+  },
+  {
+    "id": "REL-1",
+    "title": "Outbox worker & idempotency",
+    "summary": "Implement outbox pattern for outbound messages with retries, backoff, and idempotency on provider IDs.",
+    "files_to_create": "{'backend/app/core/outbox.py': 'Write/claim/mark functions with backoff schedule.', 'backend/workers/outbox_worker.py': 'Loop that sends pending messages via CommsChannel plugin.', 'backend/tests/test_outbox_flow.py': 'Pendingâsentâconfirmed transitions; retry on failure.'}",
+    "dependencies": "['C4-2', 'PLUG-2']",
+    "definition_of_done": "['All files created/updated', 'Unit tests (if any) compile and pass', 'Lint passes', 'Local smoke run works for this feature']"
+  },
+  {
+    "id": "REL-2",
+    "title": "Correlation & dedupe",
+    "summary": "Deduplicate inbound messages using (channel, external_id); reject duplicates fast.",
+    "files_to_create": "{'backend/app/inbox/dedupe.py': 'Upsert/lock on (channel, external_id) to avoid duplicates.', 'backend/tests/test_inbound_dedupe.py': 'Simulate duplicate delivery and assert single processing.'}",
+    "dependencies": "['API-1']",
+    "definition_of_done": "['All files created/updated', 'Unit tests (if any) compile and pass', 'Lint passes', 'Local smoke run works for this feature']"
+  },
+  {
+    "id": "FE-1",
+    "title": "Frontend scaffold",
+    "summary": "Create admin SPA structure with routing, query cache, and theme. No business pages yet.",
+    "files_to_create": "{'frontend/src/main.tsx': 'App bootstrap and router provider.', 'frontend/src/app/routes.tsx': 'Declare routes for Dashboard, Runs, Messages, Candidates, Panelists, Calendars, Holidays, Settings.', 'frontend/src/app/layouts/AdminLayout.tsx': 'Shell with nav and header.', 'frontend/src/api/client.ts': 'Thin API client with base URL and error handling.'}",
+    "dependencies": "['INIT-1']",
+    "definition_of_done": "['All files created/updated', 'Unit tests (if any) compile and pass', 'Lint passes', 'Local smoke run works for this feature']"
+  },
+  {
+    "id": "FE-2",
+    "title": "Runs page + Run viewer",
+    "summary": "Implement Runs list (filter by state) and Run viewer with state/events/checkpoints and a Resume action.",
+    "files_to_create": "{'frontend/src/pages/Runs.tsx': 'List runs, filter by state, link to RunViewer.', 'frontend/src/pages/RunViewer.tsx': 'Show state JSON, checkpoint history, resume textarea+button.'}",
+    "dependencies": "['API-2', 'FE-1']",
+    "definition_of_done": "['All files created/updated', 'Unit tests (if any) compile and pass', 'Lint passes', 'Local smoke run works for this feature']"
+  },
+  {
+    "id": "FE-3",
+    "title": "Unified Inbox",
+    "summary": "Implement messages list with thread correlation indicators and manual attach to a thread.",
+    "files_to_create": "{'frontend/src/pages/Messages.tsx': 'Searchable inbox; show channel, from/to, status; attach-to-run flow.'}",
+    "dependencies": "['API-1', 'FE-1']",
+    "definition_of_done": "['All files created/updated', 'Unit tests (if any) compile and pass', 'Lint passes', 'Local smoke run works for this feature']"
+  },
+  {
+    "id": "FE-4",
+    "title": "Admin CRUD pages",
+    "summary": "Implement CRUD pages for Candidates, Panelists, Calendars, Holidays with forms and validation.",
+    "files_to_create": "{'frontend/src/pages/Candidates.tsx': 'List + create/edit candidate.', 'frontend/src/pages/Panelists.tsx': 'List + connect calendar + quotas.', 'frontend/src/pages/Calendars.tsx': 'Connected accounts and health view.', 'frontend/src/pages/Holidays.tsx': 'Region presets and overrides.'}",
+    "dependencies": "['API-3', 'FE-1']",
+    "definition_of_done": "['All files created/updated', 'Unit tests (if any) compile and pass', 'Lint passes', 'Local smoke run works for this feature']"
+  },
+  {
+    "id": "FE-5",
+    "title": "Settings & Templates",
+    "summary": "Provide UI to manage templates and feature flags.",
+    "files_to_create": "{'frontend/src/pages/Settings.tsx': 'Edit templates (yaml) with preview; toggle features.'}",
+    "dependencies": "['API-4', 'FE-1']",
+    "definition_of_done": "['All files created/updated', 'Unit tests (if any) compile and pass', 'Lint passes', 'Local smoke run works for this feature']"
+  },
+  {
+    "id": "TEST-1",
+    "title": "Fixtures & sample data",
+    "summary": "Provide fixtures for candidates/panelists/holidays/messages used across tests and demo.",
+    "files_to_create": "{'backend/tests/fixtures/sample_data.json': 'Example org, users, panelists, candidates, holidays, templates.', 'frontend/public/demo.json': 'Optional demo data for mock mode.'}",
+    "dependencies": "['BE-3', 'C4-1']",
+    "definition_of_done": "['All files created/updated', 'Unit tests (if any) compile and pass', 'Lint passes', 'Local smoke run works for this feature']"
+  },
+  {
+    "id": "TEST-2",
+    "title": "E2E happy path spec",
+    "summary": "Define an E2E script: create candidate+interview â start run â interrupt on invite â resume with confirmation â book event.",
+    "files_to_create": "{'tests/e2e/happy_path.md': 'Step-by-step scripted checks.', 'tests/e2e/happy_path.sh': 'Placeholder runner invoking APIs sequentially.'}",
+    "dependencies": "['API-2', 'GRAPH-6', 'PLUG-1', 'PLUG-2']",
+    "definition_of_done": "['All files created/updated', 'Unit tests (if any) compile and pass', 'Lint passes', 'Local smoke run works for this feature']"
+  },
+  {
+    "id": "TEST-3",
+    "title": "Reschedule loop spec",
+    "summary": "E2E for reschedule: candidate proposes new time; graph loops and re-sends invite.",
+    "files_to_create": "{'tests/e2e/reschedule.md': 'Steps and expected results.'}",
+    "dependencies": "['TEST-2']",
+    "definition_of_done": "['All files created/updated', 'Unit tests (if any) compile and pass', 'Lint passes', 'Local smoke run works for this feature']"
+  },
+  {
+    "id": "OPS-1",
+    "title": "Local compose & env examples",
+    "summary": "Provide local containers and .env examples; document quick start commands.",
+    "files_to_create": "{'ops/docker-compose.yml': 'Define services for app and dependencies (placeholders).', 'ops/.env.example': 'List required env vars with hints.', 'docs/quickstart.md': 'Local quick start, including seeding and test runs.'}",
+    "dependencies": "['INIT-2', 'BE-3', 'FE-1']",
+    "definition_of_done": "['All files created/updated', 'Unit tests (if any) compile and pass', 'Lint passes', 'Local smoke run works for this feature']"
+  },
+  {
+    "id": "DOCS-1",
+    "title": "Architecture overview doc",
+    "summary": "Explain components and data flow; link to key modules and contracts.",
+    "files_to_create": "{'docs/architecture-overview.md': 'Diagram and explanation of pause/resume, plugins, inbox/outbox, admin SPA.'}",
+    "dependencies": "['GRAPH-6', 'PLUG-1', 'PLUG-2', 'PLUG-3', 'PLUG-4']",
+    "definition_of_done": "['All files created/updated', 'Unit tests (if any) compile and pass', 'Lint passes', 'Local smoke run works for this feature']"
+  }
+]
