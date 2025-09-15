@@ -1,614 +1,450 @@
-# agentic_interview_scheduler_pause_resume_onefile.py
-# ─────────────────────────────────────────────────────────────────────────────
-# Multi-agent interview scheduler POC using LangGraph with REAL pause/resume.
-# All external services are mocked. LLMs are optional (used for phrasing).
-#
-# Flow:
-#   AVH → DataHub → Panel → Availability(5x30m) → Interviewer Cards (PAUSE) →
-#   Candidate Offer(3) → Candidate Reply (PAUSE) → Zoom + Invites + Notices
-#
-# Pauses:
-#   • wait_interviewers: stops until interviewer responses (approve/suggest/decline)
-#   • wait_candidate   : stops until candidate selects a slot
-#
-# Demo Control:
-#   run_until_pause(thread_id="t1")
-#   inject_interviewer_event(thread_id="t1", ...)   # one or more
-#   resume_until_pause(thread_id="t1")
-#   inject_candidate_event(thread_id="t1", slot_id="S-...")
-#   resume_to_finish(thread_id="t1")
-#
-# Requirements:
-#   pip install langgraph langchain pydantic tqdm python-dateutil pytz jinja2 openai
-#
-# Optional LLM:
-#   export OPENAI_API_KEY=...                    # or use Azure OpenAI env vars
-#   export OPENAI_MODEL=gpt-4o-mini              # optional
-# ─────────────────────────────────────────────────────────────────────────────
+# app_candidate_availability_pg_fastapi.py
+"""
+Run:
+  pip install -U "fastapi[standard]" "uvicorn" "sqlalchemy>=2" "asyncpg" \
+                 "pydantic>=2" "langgraph" "langchain[openai]"
+
+Env:
+  export OPENAI_API_KEY=...              # if using OpenAI
+  export DATABASE_URL=postgresql+asyncpg://user:pass@host:5432/dbname
+
+Start:
+  uvicorn app_candidate_availability_pg_fastapi:app --reload
+
+Notes:
+- Postgres durable checkpointing: tries PostgresSaver; falls back to SQLite file if not available.
+- Background poller: polls an "external view" table for unprocessed candidates and starts a LangGraph run (which will PAUSE after email).
+- Resume: POST /resume to continue a paused run with the real email reply content.
+- Replace the send/read/mock functions with actual Outlook/Graph integrations later.
+"""
 
 from __future__ import annotations
-import os, json, random
-from datetime import datetime, timedelta, timezone
-from typing import TypedDict, List, Dict, Optional, Literal, Any, Tuple
+import os
+import re
+import uuid
+import json
+import asyncio
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional
 
-from langgraph.graph import StateGraph, START, END
-from langgraph.checkpoint.sqlite import SqliteSaver
+from fastapi import FastAPI, BackgroundTasks, HTTPException
+from pydantic import BaseModel, Field
 
-import pytz
-from jinja2 import Template
+from sqlalchemy import (
+    text, String, Integer, DateTime, Boolean
+)
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncEngine, AsyncSession
+from sqlalchemy.orm import sessionmaker
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Utilities
-# ─────────────────────────────────────────────────────────────────────────────
+from langchain.chat_models import init_chat_model
+from langchain_core.tools import tool
+from langgraph.graph import StateGraph, MessagesState, START, END
+from langgraph.prebuilt import create_react_agent
+from langgraph.types import Command, interrupt
 
-OUTBOX_DIR = "outbox"
-DB_PATH = "scheduler_state.sqlite"
+# =========================
+# --- Database setup ---
+# =========================
 
-def ensure_dir(p:str):
-    if not os.path.exists(p): os.makedirs(p, exist_ok=True)
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+asyncpg://postgres:postgres@localhost:5432/postgres")
+engine: AsyncEngine = create_async_engine(DATABASE_URL, echo=False, future=True)
+AsyncSessionLocal = sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
-def write_outbox(name:str, content:str):
-    ensure_dir(OUTBOX_DIR)
-    path = os.path.join(OUTBOX_DIR, name)
-    with open(path, "w", encoding="utf-8") as f: f.write(content)
-    return path
+# Minimal schema (you can migrate this with Alembic later)
+DDL = """
+-- External source of candidates (you can point this to a real VIEW in prod).
+CREATE TABLE IF NOT EXISTS candidates_view (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  email TEXT NOT NULL,
+  processed BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
 
-def tz(tz_str:str): return pytz.timezone(tz_str)
-def now_utc(): return datetime.now(timezone.utc)
-def now_iso(): return now_utc().isoformat()
-def now_local(tz_str:str): return datetime.now(tz(tz_str))
-def as_tz(dt:datetime, tz_str:str):
-    if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(tz(tz_str))
-def iso_in_tz(dt:datetime, tz_str:str): return as_tz(dt, tz_str).isoformat()
+-- Track email threads (for observability / correlation).
+CREATE TABLE IF NOT EXISTS email_threads (
+  thread_id TEXT PRIMARY KEY,
+  candidate_id TEXT NOT NULL,
+  email TEXT NOT NULL,
+  run_thread_key TEXT NOT NULL,  -- LangGraph thread key used as config
+  created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
 
-def use_llm() -> bool:
-    return bool(os.environ.get("OPENAI_API_KEY") or os.environ.get("AZURE_OPENAI_API_KEY"))
+-- Store parsed availability snapshots (for downstream systems to consume).
+CREATE TABLE IF NOT EXISTS availability (
+  id TEXT PRIMARY KEY,
+  candidate_id TEXT NOT NULL,
+  payload JSONB NOT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+"""
 
-def llm_model_name() -> str:
-    return os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+# =========================
+# --- LangGraph checkpointing (durable) ---
+# =========================
 
-def llm_chat(system: str, user: str) -> str:
+# Prefer a Postgres checkpointer if available; otherwise fallback to SQLite file.
+def make_checkpointer():
     try:
-        if use_llm():
-            from openai import OpenAI
-            client = OpenAI()
-            resp = client.chat.completions.create(
-                model=llm_model_name(),
-                messages=[{"role":"system","content":system},{"role":"user","content":user}],
-                temperature=0.3,
-            )
-            return resp.choices[0].message.content.strip()
+        # Newer LangGraph often exposes a Postgres saver. If your installed version
+        # uses a different path, adjust this import accordingly.
+        from langgraph.checkpoint.postgres import PostgresSaver  # type: ignore
+        return PostgresSaver(DATABASE_URL)
     except Exception:
-        pass
-    # deterministic fallback
-    return Template("{{ user }}").render(user=user)
+        # Safe fallback: SQLite file (still durable, just not Postgres).
+        from langgraph.checkpoint.sqlite import SqliteSaver  # type: ignore
+        os.makedirs(".checkpoints", exist_ok=True)
+        return SqliteSaver(".checkpoints/langgraph.db")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# State model
-# ─────────────────────────────────────────────────────────────────────────────
+checkpointer = make_checkpointer()
 
-class Candidate(TypedDict, total=False):
-    id: str
-    name: str
-    email: str
-    capability: str
-    sub_capability: str
-    role: str
-    location: str
-    timezone: str
-    hiring_manager_email: str
-    hiring_manager_name: str
+# =========================
+# --- LLM + Tools ---
+# =========================
 
-class Panelist(TypedDict, total=False):
-    id: str
-    name: str
-    email: str
-    capability: str
-    sub_capability: str
-    role: str
-    timezone: str
+_llm = init_chat_model("openai:gpt-4o-mini", temperature=0)
 
-class Slot(TypedDict, total=False):
-    id: str
-    start_iso: str
-    end_iso: str
-    source: Literal["auto","suggested_by_interviewer","candidate_proposed","rebook"]
-    approvals: Dict[str, Literal["approved","declined","no_response"]]
+class Slot(BaseModel):
+    date: str = Field(..., description="ISO date (YYYY-MM-DD) or best-effort date")
+    start_local: str = Field(..., description="HH:MM 24h")
+    end_local: str = Field(..., description="HH:MM 24h")
+    tz: str = Field("Asia/Kolkata", description="IANA timezone")
+    flexible: bool = Field(False)
+    notes: str = Field("", description="Nuance from email")
 
-class Meeting(TypedDict, total=False):
-    join_url: str
-    start_iso: str
-    end_iso: str
-    platform: Literal["zoom"]
-    calendar_event_ids: Dict[str,str]
+class AvailabilityExtraction(BaseModel):
+    slots: List[Slot]
+    confidence: float = Field(..., ge=0, le=1)
+    normalized_to: str = Field("Asia/Kolkata")
+    raw_excerpt: str
 
-class GraphConfig(TypedDict, total=False):
-    business_hours_start: int
-    business_hours_end: int
-    minutes_per_slot: int
-    days_ahead: int
-    needed_slots: int
-    approvals_required: int
-    allow_alt_panelists: bool
+@tool
+def fetch_candidate_details(candidate_id: str) -> dict:
+    """
+    Read candidate details from Postgres (backed by your external view).
+    """
+    # This tool runs sync; for simplicity we do a blocking call via asyncio.run_until_complete-like pattern.
+    # In real builds, prefer async tools or prefetch details into the agent state.
+    loop = asyncio.get_event_loop()
+    async def _q():
+        async with AsyncSessionLocal() as s:
+            row = (await s.execute(
+                text("SELECT id, name, email FROM candidates_view WHERE id=:cid")
+            .bindparams(cid=candidate_id))).mappings().first()
+            if not row:
+                raise ValueError(f"Unknown candidate_id: {candidate_id}")
+            return {"id": row["id"], "name": row["name"], "email": row["email"]}
+    return loop.run_until_complete(_q())
 
-class GraphState(TypedDict, total=False):
-    candidate: Candidate
-    requested_panel_criteria: Dict[str,str]
-    panel: List[Panelist]
-    alternate_panel: List[Panelist]
+@tool
+def send_candidate_email(to: str, subject: str, body: str) -> str:
+    """
+    Mock: 'send' an email and create a thread_id; also persist the thread in DB for tracking.
+    Replace this with MS Graph send + thread id mapping.
+    """
+    thread_id = f"mock-thread-{uuid.uuid4().hex[:8]}"
+    run_thread_key = f"run-{uuid.uuid4().hex[:8]}"
 
-    auto_proposed_slots: List[Slot]
-    interviewer_responses: Dict[str, Literal["approved","declined","suggested","no_response"]]
-    interviewer_suggested_slots: List[Slot]
+    loop = asyncio.get_event_loop()
+    async def _ins():
+        async with AsyncSessionLocal() as s:
+            # We don't yet know candidate_id in this tool; the agent should pass it in subject/body or state.
+            # For simplicity, try to extract candidate_id if embedded, else store just email.
+            m = re.search(r"\[CID:(.*?)\]", subject or "")
+            candidate_id = m.group(1).strip() if m else "UNKNOWN"
+            await s.execute(text(
+                "INSERT INTO email_threads(thread_id, candidate_id, email, run_thread_key) "
+                "VALUES (:tid, :cid, :email, :rtk)"
+            ), {"tid": thread_id, "cid": candidate_id, "email": to, "rtk": run_thread_key})
+            await s.commit()
+    loop.run_until_complete(_ins())
+    return thread_id
 
-    candidate_slots_offered: List[Slot]
-    candidate_selection: Optional[Slot]
+@tool
+def read_inbox(thread_id: str, newer_than_minutes: int = 10080) -> str:
+    """
+    Mock: Reading inbox is *not* auto-injected now. This is kept for parity.
+    Real builds would pull the latest inbound email body from MS Graph by thread.
+    """
+    return ""  # Intentionally empty; we rely on /resume to provide the real reply body.
 
-    meeting: Optional[Meeting]
+@tool
+def llm_parse_availability(email_text: str) -> dict:
+    """
+    Use LLM structured output to parse free-text availability.
+    """
+    parser = _llm.with_structured_output(AvailabilityExtraction)
+    prompt = (
+        "Extract interview availability slots from the email text.\n"
+        "- Prefer concrete dates; if only weekdays are given, choose the next occurrence.\n"
+        "- Return HH:MM 24h times; assume Asia/Kolkata when unspecified.\n"
+        "- Flag flexible=True if ranges/alternatives implied.\n"
+        "- Include a short raw_excerpt supporting the extraction."
+    )
+    result: AvailabilityExtraction = parser.invoke([
+        {"role": "system", "content": prompt},
+        {"role": "user", "content": email_text},
+    ])
+    return result.model_dump()
 
-    # Pause bookkeeping
-    waiting_for: Optional[Literal["interviewers","candidate"]]
-    events: List[Dict[str,Any]]  # event log (injected externally)
+candidate_tools = [
+    fetch_candidate_details,
+    send_candidate_email,
+    read_inbox,
+    llm_parse_availability,
+]
 
-    cfg: GraphConfig
-    logs: List[str]
-    errors: List[str]
+candidate_agent = create_react_agent(
+    model=_llm,
+    tools=candidate_tools,
+    name="candidate_availability_agent",
+    prompt=(
+        "You are a candidate-availability agent.\n"
+        "Goal: For a given candidate_id, fetch details, email them to request availability, then WAIT.\n"
+        "Protocol:\n"
+        "1) fetch_candidate_details(candidate_id)\n"
+        "2) send_candidate_email(to, subject, body)\n"
+        "3) Immediately STOP and output exactly: AWAIT_REPLY(thread_id=<the_returned_thread_id>)\n"
+        "4) When resumed with the candidate's reply text in the next user message,\n"
+        "   call llm_parse_availability(email_text) and summarize the slots.\n"
+        "Be concise and always follow the protocol."
+    ),
+)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Mocks (DataHub, Panel, Calendar, Email, Zoom, HM)
-# ─────────────────────────────────────────────────────────────────────────────
+def supervisor_node(state: MessagesState):
+    # Minimal router; first user message -> worker. If worker said wait, a conditional edge handles it.
+    return {"messages": []}
 
-class MockDataHub:
-    MOCK_CANDIDATES = [{
-        "id":"CAND-001","name":"Aarav Shah","email":"aarav.shah@example.com",
-        "capability":"Data","sub_capability":"ML Engineering","role":"Senior Engineer",
-        "location":"Hyderabad","timezone":"Asia/Kolkata",
-        "hiring_manager_email":"hm.vidya@corp.example","hiring_manager_name":"Vidya N",
-    }]
-    def fetch_new_candidates(self) -> List[Dict]: return self.MOCK_CANDIDATES.copy()
+def _extract_thread_id(text: str) -> Optional[str]:
+    m = re.search(r"AWAIT_REPLY\(\s*thread_id=([^)]+)\)", text)
+    return m.group(1).strip() if m else None
 
-class MockPanelRepo:
-    PANEL = [
-        {"id":"P-101","name":"R. Kumar","email":"rkumar@corp.example","capability":"Data","sub_capability":"ML Engineering","role":"Senior Engineer","timezone":"Asia/Kolkata"},
-        {"id":"P-102","name":"S. Iyer","email":"siyer@corp.example","capability":"Data","sub_capability":"ML Engineering","role":"Senior Engineer","timezone":"Asia/Kolkata"},
-        {"id":"P-103","name":"Ananya Gupta","email":"ananya.gupta@corp.example","capability":"Data","sub_capability":"ML Engineering","role":"Principal Engineer","timezone":"Asia/Kolkata"},
-        {"id":"P-104","name":"D. Bose","email":"dbose@corp.example","capability":"Data","sub_capability":"ML Engineering","role":"Engineer","timezone":"Asia/Kolkata"},
-        {"id":"P-105","name":"M. Krish","email":"mkrish@corp.example","capability":"Data","sub_capability":"ML Engineering","role":"Senior Engineer","timezone":"Asia/Kolkata"},
-    ]
-    def find_panel(self, capability:str, sub_capability:str, role:str) -> List[Dict]:
-        primary = [p for p in self.PANEL if p["capability"]==capability and p["sub_capability"]==sub_capability and (p["role"]==role or role in ("Senior Engineer","Engineer"))]
-        return primary[:3]
-    def find_alternates(self, capability:str, sub_capability:str, role:str, exclude_emails:List[str]) -> List[Dict]:
-        pool = [p for p in self.PANEL if p["capability"]==capability and p["sub_capability"]==sub_capability and p["email"] not in exclude_emails]
-        return [p for p in pool if p not in self.find_panel(capability, sub_capability, role)]
+def await_reply_node(state: MessagesState):
+    # Look for the most recent assistant message that announced AWAIT_REPLY(...)
+    assistant_msgs = [m for m in state["messages"] if m["role"] == "assistant"]
+    thread_id = None
+    for m in reversed(assistant_msgs):
+        txt = m.get("content", "")
+        if isinstance(txt, list):
+            txt = " ".join([c.get("text", "") for c in txt if isinstance(c, dict)])
+        tid = _extract_thread_id(str(txt))
+        if tid:
+            thread_id = tid
+            break
 
-class MockCalendar:
-    def __init__(self):
-        self._busy: Dict[str, List[Tuple[datetime,datetime,str]]] = {}
-    def _daily_busy_blocks(self, day:datetime):  # 11:30–12:30 local busy
-        s = day.replace(hour=11,minute=30,second=0,microsecond=0)
-        e = day.replace(hour=12,minute=30,second=0,microsecond=0)
-        return [(s,e)]
-    def _overlaps(self, a_s:datetime,a_e:datetime,b_s:datetime,b_e:datetime)->bool:
-        return not (a_e <= b_s or a_s >= b_e)
-    def _person_busy(self, email:str): return self._busy.get(email,[])
-    def find_group_slots(self, attendee_emails:List[str], duration_min:int, days_ahead:int, slots_needed:int, tz_str:str, business_hours:Tuple[int,int]) -> List[Slot]:
-        out: List[Slot]=[]
-        cursor = now_local(tz_str).replace(hour=business_hours[0], minute=0, second=0, microsecond=0)
-        end_window = now_local(tz_str) + timedelta(days=days_ahead)
-        while cursor < end_window and len(out) < slots_needed:
-            if cursor.weekday() >= 5:
-                cursor = cursor + timedelta(days=1)
-                cursor = cursor.replace(hour=business_hours[0], minute=0, second=0, microsecond=0)
+    resume_payload = interrupt({
+        "reason": "waiting_for_candidate_reply",
+        "thread_id": thread_id,
+        "instruction": "POST /resume with {'thread_id': <same>, 'reply_text': '...'}"
+    })
+
+    if isinstance(resume_payload, dict):
+        reply_text = resume_payload.get("reply_text", "")
+    else:
+        reply_text = str(resume_payload or "")
+
+    injected = {
+        "role": "user",
+        "content": f"Candidate replied:\n\n{reply_text}\n\nPlease parse availability using llm_parse_availability."
+    }
+    return {"messages": [injected]}
+
+# Build the graph
+graph = StateGraph(MessagesState)
+graph.add_node("supervisor", supervisor_node)
+graph.add_node("candidate_availability_agent", candidate_agent)
+graph.add_node("await_reply", await_reply_node)
+
+graph.add_edge(START, "supervisor")
+graph.add_edge("supervisor", "candidate_availability_agent")
+
+def route_after_worker(state: MessagesState):
+    last = state["messages"][-1]
+    txt = last.get("content", "") if isinstance(last, dict) else str(last)
+    if isinstance(txt, list):
+        txt = " ".join([c.get("text", "") for c in txt if isinstance(c, dict)])
+    return "await_reply" if "AWAIT_REPLY(" in str(txt) else "supervisor"
+
+graph.add_conditional_edges(
+    "candidate_availability_agent",
+    route_after_worker,
+    {"await_reply": "await_reply", "supervisor": "supervisor"},
+)
+
+graph.add_edge("await_reply", "candidate_availability_agent")
+graph.add_edge("supervisor", END)
+
+app_graph = graph.compile(checkpointer=checkpointer)
+
+# =========================
+# --- FastAPI app ---
+# =========================
+
+app = FastAPI(title="Candidate Availability Orchestrator (LangGraph + Postgres + FastAPI)")
+
+POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "30"))
+
+class StartRunRequest(BaseModel):
+    candidate_id: str
+
+class ResumeRequest(BaseModel):
+    thread_id: str
+    reply_text: str
+
+@app.on_event("startup")
+async def on_startup():
+    # Create tables if not present
+    async with engine.begin() as conn:
+        await conn.execute(text(DDL))
+
+    # Start background poller
+    app.state.poller_task = asyncio.create_task(background_poller())
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    task: asyncio.Task = getattr(app.state, "poller_task", None)
+    if task and not task.done():
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+@app.get("/health")
+async def health():
+    return {"ok": True, "time": datetime.utcnow().isoformat()}
+
+@app.post("/run")
+async def run_once(req: StartRunRequest):
+    cfg = {"configurable": {"thread_id": f"thread-{req.candidate_id}"}}
+    initial = {
+        "messages": [{
+            "role": "user",
+            "content": f"For candidate_id {req.candidate_id}, request availability by email, then wait for reply."
+        }]
+    }
+    # Stream until interrupt (pause)
+    events = []
+    async for event in app_graph.astream(initial, cfg, stream_mode="updates"):
+        events.append(event)
+
+    # Mark candidate processed (emailed)
+    async with AsyncSessionLocal() as s:
+        await s.execute(text(
+            "UPDATE candidates_view SET processed=TRUE, updated_at=NOW() WHERE id=:cid"
+        ), {"cid": req.candidate_id})
+        await s.commit()
+
+    return {"status": "started", "thread_key": cfg["configurable"]["thread_id"], "events": events[-3:]}
+
+@app.post("/resume")
+async def resume(req: ResumeRequest):
+    # Find the run thread key for this email thread
+    async with AsyncSessionLocal() as s:
+        row = (await s.execute(
+            text("SELECT run_thread_key, candidate_id FROM email_threads WHERE thread_id=:tid")
+            .bindparams(tid=req.thread_id)
+        )).mappings().first()
+        if not row:
+            raise HTTPException(status_code=404, detail="Unknown thread_id")
+
+        thread_key = row["run_thread_key"]
+        candidate_id = row["candidate_id"]
+
+    cfg = {"configurable": {"thread_id": thread_key}}
+    resume_cmd = Command(resume={"reply_text": req.reply_text})
+
+    events = []
+    async for event in app_graph.astream(resume_cmd, cfg, stream_mode="updates"):
+        events.append(event)
+
+    # Extract the final structured availability (if the agent produced it)
+    # In practice, you'd inspect app_graph state; here we try to find an llm_parse_availability tool output in messages.
+    # As a simpler approach, rely on the agent to print a JSON block or tool return; we persist a snapshot too.
+    # We'll store the *latest* available availability tool output if present.
+    # NOTE: For robust extraction, integrate callbacks or a node to persist explicitly.
+    # Here, we just persist the raw assistant last message and trust the agent to summarize with JSON.
+    # You can improve this by pushing tool results into state and grabbing them here.
+    # For now, persist the last assistant message alongside candidate_id.
+    latest = None
+    if events:
+        # scan last few events for "messages" payloads
+        for ev in reversed(events):
+            try:
+                # ev is often like {'candidate_availability_agent': {'messages': [...]} } or similar
+                node = ev.get("candidate_availability_agent") or ev.get("supervisor") or ev.get("await_reply")
+                if node and "messages" in node and node["messages"]:
+                    latest = node["messages"][-1]
+                    break
+            except Exception:
                 continue
-            if not (business_hours[0] <= cursor.hour < business_hours[1]):
-                cursor += timedelta(minutes=30); continue
-            slot_end = cursor + timedelta(minutes=duration_min)
-            ok = True
-            for email in attendee_emails:
-                for (bstart,bend) in self._daily_busy_blocks(cursor):
-                    if self._overlaps(cursor, slot_end, bstart,bend): ok=False; break
-                if not ok: break
-                for (bstart,bend,_label) in self._person_busy(email):
-                    if self._overlaps(cursor, slot_end, bstart,bend): ok=False; break
-                if not ok: break
-            if ok:
-                sid = f"S-{abs(hash((cursor.isoformat(), tuple(sorted(attendee_emails))))) & 0xfffffff}"
-                out.append({"id":sid,"start_iso":iso_in_tz(cursor,tz_str),"end_iso":iso_in_tz(slot_end,tz_str),"source":"auto","approvals":{e:"no_response" for e in attendee_emails}})
-            cursor += timedelta(minutes=30)
-        return out
-    def create_calendar_event(self, title:str, start_iso:str, end_iso:str, attendees:List[str]) -> Dict[str,str]:
-        s = datetime.fromisoformat(start_iso); e = datetime.fromisoformat(end_iso)
-        for a in attendees: self._busy.setdefault(a, []).append((s,e,title))
-        return {a: f"cal_evt_{abs(hash((a,start_iso,end_iso))) & 0xfffffff}" for a in attendees}
-    def still_free_for_group(self, start_iso:str, end_iso:str, attendees:List[str]) -> bool:
-        s = datetime.fromisoformat(start_iso); e = datetime.fromisoformat(end_iso)
-        for a in attendees:
-            for (bstart,bend,_label) in self._person_busy(a):
-                if self._overlaps(s,e,bstart,bend): return False
-            for (bstart,bend) in self._daily_busy_blocks(s):
-                if self._overlaps(s,e,bstart,bend): return False
-        return True
 
-class MockOutlookEmail:
-    CARD_BASE = {"type":"AdaptiveCard","version":"1.5","body":[{"type":"TextBlock","text":"{{title}}","weight":"Bolder","size":"Medium"},{"type":"TextBlock","text":"{{message}}","wrap":True},{"type":"TextBlock","text":"Proposed slots:","weight":"Bolder"},{"type":"Container","items":[]}],"actions":[{"type":"Action.Submit","title":"Approve","data":{"action":"approve"}},{"type":"Action.Submit","title":"Suggest another time","data":{"action":"suggest"}},{"type":"Action.Submit","title":"Decline","data":{"action":"decline"}}]}
-    def send_interviewer_card(self,to_email:str,title:str,message:str,slots:List[Slot]):
-        card = json.loads(json.dumps(self.CARD_BASE))
-        card["body"][3]["items"] = [{"type":"TextBlock","text":f"- {s['start_iso']} → {s['end_iso']} (id={s['id']})"} for s in slots]
-        payload = {"to":to_email,"subject":title,"card_json":card,"plaintext":f"{message}\n\n"+"\n".join([f"- {s['start_iso']} → {s['end_iso']} (id={s['id']})" for s in slots]),"sent_at":now_iso()}
-        base = f"interviewer_{to_email.replace('@','_at_')}.json"
-        write_outbox(base, json.dumps(payload, indent=2))
-        write_outbox(base.replace(".json",".md"), f"# {title}\n\nTo: {to_email}\n\n{payload['plaintext']}")
-    def send_internal_notice(self,to_email:str,subject:str,body:str):
-        write_outbox(f"internal_{to_email.replace('@','_at_')}.md", f"# {subject}\n\n{body}")
+    snapshot = {"assistant_message": latest}
+    async with AsyncSessionLocal() as s:
+        await s.execute(text(
+            "INSERT INTO availability (id, candidate_id, payload) VALUES (:id, :cid, :payload::jsonb)"
+        ), {"id": f"avail-{uuid.uuid4().hex[:8]}", "cid": candidate_id, "payload": json.dumps(snapshot)})
+        await s.commit()
 
-class MockExternalEmail:
-    def send_candidate_slots(self,to_email:str,candidate_name:str,slots:List[Slot],hm_email:str):
-        text = llm_chat("You are a recruiting coordinator writing concise scheduling emails.",
-                        f"Propose 3 slots to {candidate_name}. Ask them to reply with SELECT <slot-id>.\nSlots:\n"+"\n".join([f"- {s['start_iso']} → {s['end_iso']} (id={s['id']})" for s in slots])+f"\nCC HM: {hm_email}")
-        write_outbox(f"candidate_{to_email.replace('@','_at_')}.md", text)
-    def send_confirmation(self,to_email:str,meeting_info:Dict,cc:List[str]):
-        text = llm_chat("You are a recruiting coordinator sending confirmations.",
-                        f"Confirm interview.\nJoin URL: {meeting_info['join_url']}\nTime: {meeting_info['start_iso']} → {meeting_info['end_iso']}\nCC: {', '.join(cc)}")
-        write_outbox(f"candidate_confirm_{to_email.replace('@','_at_')}.md", text)
+    return {"status": "resumed", "thread_key": thread_key, "events": events[-5:]}
 
-class MockZoom:
-    def create_meeting(self,topic:str,start_iso:str,end_iso:str,host_email:str)->Dict:
-        return {"join_url":f"https://zoom.example/j/{abs(hash((topic,start_iso)))%10**9}","start_iso":start_iso,"end_iso":end_iso,"platform":"zoom","host":host_email,"created_at":now_iso()}
+# =========================
+# --- Background Poller ---
+# =========================
 
-class HiringManagerEscalator:
-    def __init__(self, mail:MockOutlookEmail): self.mail = mail
-    def request_input(self, hm_email:str, subject:str, body:str):
-        self.mail.send_internal_notice(hm_email, subject, body)
+async def background_poller():
+    """
+    Periodically checks the 'candidates_view' for records where processed = FALSE,
+    and starts a graph run for each one (which will pause after emailing).
+    """
+    while True:
+        try:
+            async with AsyncSessionLocal() as s:
+                rows = (await s.execute(
+                    text("SELECT id FROM candidates_view WHERE processed=FALSE ORDER BY created_at ASC LIMIT 10")
+                )).mappings().all()
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Agents
-# ─────────────────────────────────────────────────────────────────────────────
+            for r in rows:
+                cid = r["id"]
+                cfg = {"configurable": {"thread_id": f"thread-{cid}"}}
+                initial = {
+                    "messages": [{
+                        "role": "user",
+                        "content": f"For candidate_id {cid}, request availability by email, then wait for reply."
+                    }]
+                }
+                # Stream until interrupt; swallow the stream in the poller (logs can be added as needed)
+                async for _ in app_graph.astream(initial, cfg, stream_mode="updates"):
+                    pass
 
-class IntakeAgent:
-    def __init__(self): self.datahub = MockDataHub()
-    def act(self, state:GraphState)->GraphState:
-        cands = self.datahub.fetch_new_candidates()
-        if not cands: state.setdefault("errors",[]).append("No candidates from DataHub"); return state
-        cand = cands[0]
-        state["candidate"] = cand
-        state["requested_panel_criteria"] = {"capability":cand["capability"],"sub_capability":cand["sub_capability"],"role":cand["role"]}
-        state.setdefault("logs",[]).append("Intake: candidate loaded")
-        return state
+                # mark processed
+                async with AsyncSessionLocal() as s:
+                    await s.execute(text(
+                        "UPDATE candidates_view SET processed=TRUE, updated_at=NOW() WHERE id=:cid"
+                    ), {"cid": cid})
+                    await s.commit()
 
-class PanelAgent:
-    def __init__(self): self.repo = MockPanelRepo()
-    def act(self, state:GraphState)->GraphState:
-        crit = state.get("requested_panel_criteria",{})
-        prim = self.repo.find_panel(crit.get("capability",""), crit.get("sub_capability",""), crit.get("role",""))
-        if not prim: state.setdefault("errors",[]).append("No panelists found")
-        state["panel"] = prim
-        state["alternate_panel"] = self.repo.find_alternates(crit.get("capability",""), crit.get("sub_capability",""), crit.get("role",""), [p["email"] for p in prim])
-        state.setdefault("logs",[]).append(f"Panel: primary={len(prim)} alternates={len(state['alternate_panel'])}")
-        return state
+        except Exception as e:
+            # Log and keep going
+            print(f"[poller] error: {e}")
 
-class ComplianceAgent:
-    def act(self, state:GraphState)->GraphState:
-        if not state.get("candidate",{}).get("timezone"): state.setdefault("errors",[]).append("Candidate timezone missing")
-        if state.get("candidate",{}).get("role") in ("Senior Engineer","Principal Engineer"):
-            if len(state.get("panel",[])) < 2: state.setdefault("errors",[]).append("Quorum not met (need ≥2 interviewers)")
-        state.setdefault("logs",[]).append("Compliance: OK")
-        return state
+        await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
-class AvailabilityAgent:
-    def __init__(self, cal:MockCalendar): self.cal=cal
-    def act(self, state:GraphState)->GraphState:
-        emails = [p["email"] for p in state.get("panel",[])]
-        if not emails: state.setdefault("errors",[]).append("No panel emails"); return state
-        cfg = state["cfg"]
-        slots = self.cal.find_group_slots(emails, cfg["minutes_per_slot"], cfg["days_ahead"], cfg["needed_slots"], state["candidate"]["timezone"], (cfg["business_hours_start"], cfg["business_hours_end"]))
-        state["auto_proposed_slots"] = slots
-        state.setdefault("logs",[]).append(f"Availability: proposed {len(slots)}")
-        return state
+# =========================
+# --- Utilities to seed demo data (optional) ---
+# =========================
 
-class InterviewerCommsAgent:
-    def __init__(self, mail:MockOutlookEmail): self.mail=mail
-    def act(self, state:GraphState)->GraphState:
-        slots = state.get("auto_proposed_slots",[])
-        panel = state.get("panel",[])
-        msg = llm_chat("You are HR asking for quick approvals.","Approve or suggest a time for the proposed interview slots.")
-        for p in panel:
-            self.mail.send_interviewer_card(p["email"], "Interview availability confirmation", msg, slots)
-        state["waiting_for"] = "interviewers"
-        state.setdefault("interviewer_responses", {p["email"]:"no_response" for p in panel})
-        state.setdefault("logs",[]).append("InterviewerComms: cards sent; waiting_for=interviewers")
-        return state
-
-class CandidateCommsAgent:
-    def __init__(self, ext:MockExternalEmail): self.ext = ext
-    def act(self, state:GraphState)->GraphState:
-        # Merge approvals & suggestions to pick 3 to offer
-        approvals_required = state["cfg"]["approvals_required"]
-        auto = state.get("auto_proposed_slots", [])
-        suggested = state.get("interviewer_suggested_slots", [])
-        responses = state.get("interviewer_responses", {})
-        def approved_count(s:Slot)->int: return sum(1 for v in s["approvals"].values() if v=="approved")
-        # Apply approvals to autos
-        for s in auto:
-            for email, resp in responses.items():
-                if resp=="approved": s["approvals"][email]="approved"
-                elif resp=="declined": s["approvals"][email]="declined"
-        approved = [s for s in auto if approved_count(s)>=approvals_required]
-        ranked = approved + suggested + [s for s in auto if s not in approved]
-        chosen = ranked[:3]
-        if not chosen:
-            state.setdefault("errors",[]).append("No slots to offer candidate")
-            return state
-        state["candidate_slots_offered"] = chosen
-        c = state["candidate"]
-        self.ext.send_candidate_slots(c["email"], c["name"], chosen, c["hiring_manager_email"])
-        state["waiting_for"] = "candidate"
-        state.setdefault("logs",[]).append(f"CandidateComms: offered {len(chosen)}; waiting_for=candidate")
-        return state
-
-class SchedulerAgent:
-    def __init__(self, cal:MockCalendar, zoom:MockZoom, ext:MockExternalEmail, mail:MockOutlookEmail):
-        self.cal, self.zoom, self.ext, self.mail = cal, zoom, ext, mail
-    def _escalate(self, state:GraphState, reason:str):
-        HiringManagerEscalator(self.mail).request_input(state["candidate"]["hiring_manager_email"], "Scheduling: input needed", reason)
-        state.setdefault("logs",[]).append(f"Escalation→HM: {reason}")
-    def act(self, state:GraphState)->GraphState:
-        sel = state.get("candidate_selection")
-        if not sel:
-            self._escalate(state, "Candidate has not selected a slot yet; re-offer or nudge if needed.")
-            return state
-        attendees = [p["email"] for p in state.get("panel",[])] + [state["candidate"]["hiring_manager_email"]]
-        if not self.cal.still_free_for_group(sel["start_iso"], sel["end_iso"], attendees):
-            state.setdefault("logs",[]).append("Scheduler: selected slot now busy; attempting alternates")
-            alts = [s for s in state.get("candidate_slots_offered",[]) if s["id"] != sel["id"]]
-            picked = None
-            for s in alts:
-                if self.cal.still_free_for_group(s["start_iso"], s["end_iso"], attendees):
-                    picked = s; break
-            if not picked:
-                st = datetime.fromisoformat(state["candidate_slots_offered"][0]["start_iso"]) + timedelta(days=1)
-                picked = {"id":f"RE-{abs(hash(st.isoformat()))&0xfffffff}","start_iso":st.isoformat(),"end_iso":(st+timedelta(minutes=state['cfg']['minutes_per_slot'])).isoformat(),"source":"rebook","approvals":{a:"approved" for a in attendees}}
-                state.setdefault("logs",[]).append("Scheduler: rebooked one day later")
-            sel = picked
-            state["candidate_selection"] = picked
-        meeting = self.zoom.create_meeting(f"Interview: {state['candidate']['name']}", sel["start_iso"], sel["end_iso"], state["panel"][0]["email"])
-        cal_ids = self.cal.create_calendar_event("Interview", meeting["start_iso"], meeting["end_iso"], attendees)
-        meeting["calendar_event_ids"] = cal_ids
-        state["meeting"] = meeting
-        self.ext.send_confirmation(state["candidate"]["email"], meeting, cc=attendees)
-        for a in attendees:
-            self.mail.send_internal_notice(a, "Interview scheduled", f"Zoom: {meeting['join_url']}\nTime: {meeting['start_iso']} → {meeting['end_iso']}")
-        state.setdefault("logs",[]).append("Scheduler: meeting scheduled & notices sent")
-        return state
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Graph with conditional PAUSE points
-# ─────────────────────────────────────────────────────────────────────────────
-
-def default_cfg() -> GraphConfig:
-    return {"business_hours_start":10,"business_hours_end":18,"minutes_per_slot":30,"days_ahead":5,"needed_slots":5,"approvals_required":2,"allow_alt_panelists":True}
-
-# Build singletons for tool instances
-_CAL = MockCalendar()
-_MAIL = MockOutlookEmail()
-_EXT = MockExternalEmail()
-_ZOOM = MockZoom()
-
-_INTK = IntakeAgent()
-_PANL = PanelAgent()
-_COMP = ComplianceAgent()
-_AVAI = AvailabilityAgent(_CAL)
-_ICMS = InterviewerCommsAgent(_MAIL)
-_CCMS = CandidateCommsAgent(_EXT)
-_SCHD = SchedulerAgent(_CAL, _ZOOM, _EXT, _MAIL)
-
-def build_graph():
-    builder = StateGraph(GraphState)
-
-    def n_intake(s:GraphState)->GraphState: return _INTK.act(s)
-    def n_panel(s:GraphState)->GraphState: return _PANL.act(s)
-    def n_compliance(s:GraphState)->GraphState: return _COMP.act(s)
-    def n_availability(s:GraphState)->GraphState: return _AVAI.act(s)
-    def n_interviewer_comms(s:GraphState)->GraphState: return _ICMS.act(s)
-
-    def n_wait_interviewers(s:GraphState)->GraphState:
-        # If approvals or suggestions present in events, apply and continue; else PAUSE
-        events = s.get("events", [])
-        updated = False
-        for ev in events:
-            if ev.get("type")=="interviewer_response":
-                email = ev.get("email")
-                action = ev.get("action")  # approved | declined | suggest
-                s.setdefault("interviewer_responses",{}).setdefault(email,"no_response")
-                if action=="approve":
-                    s["interviewer_responses"][email]="approved"
-                    # mark approvals on each auto slot
-                    for slot in s.get("auto_proposed_slots",[]):
-                        slot["approvals"][email]="approved"
-                    updated = True
-                elif action=="decline":
-                    s["interviewer_responses"][email]="declined"
-                    for slot in s.get("auto_proposed_slots",[]):
-                        slot["approvals"][email]="declined"
-                    updated = True
-                elif action=="suggest":
-                    s["interviewer_responses"][email]="suggested"
-                    tz_str = next((p["timezone"] for p in s.get("panel",[]) if p["email"]==email), s["candidate"]["timezone"])
-                    base = now_local(tz_str).replace(hour=14, minute=0, second=0, microsecond=0)+timedelta(days=1)
-                    new_slot = {"id":f"SG-{abs(hash((email, base.isoformat())))&0xfffffff}","start_iso":iso_in_tz(base,tz_str),"end_iso":iso_in_tz(base+timedelta(minutes=s['cfg']['minutes_per_slot']),tz_str),"source":"suggested_by_interviewer","approvals":{p["email"]:"no_response" for p in s.get("panel",[])}}
-                    s.setdefault("interviewer_suggested_slots",[]).append(new_slot)
-                    updated = True
-        # clear events consumed
-        s["events"] = [e for e in events if e.get("type")!="interviewer_response"]
-
-        # Check if we have enough approvals or at least some proposals
-        approvals_required = s["cfg"]["approvals_required"]
-        def approved_count(slot:Slot)->int: return sum(1 for v in slot["approvals"].values() if v=="approved")
-        enough_approved = any(approved_count(sl)>=approvals_required for sl in s.get("auto_proposed_slots",[]))
-        have_suggestions = bool(s.get("interviewer_suggested_slots"))
-        if enough_approved or have_suggestions:
-            s["waiting_for"] = None
-            s.setdefault("logs",[]).append("WaitInterviewers: have approvals/suggestions → continue")
-        else:
-            s["waiting_for"] = "interviewers"
-            s.setdefault("logs",[]).append("WaitInterviewers: still waiting (PAUSE)")
-        return s
-
-    def n_candidate_comms(s:GraphState)->GraphState: return _CCMS.act(s)
-
-    def n_wait_candidate(s:GraphState)->GraphState:
-        # Look for candidate selection events
-        events = s.get("events", [])
-        for ev in events:
-            if ev.get("type")=="candidate_selection":
-                slot_id = ev.get("slot_id")
-                # accept only if it was offered
-                for sl in s.get("candidate_slots_offered",[]):
-                    if sl["id"]==slot_id:
-                        s["candidate_selection"] = sl
-                        s["waiting_for"] = None
-                        s.setdefault("logs",[]).append(f"WaitCandidate: candidate selected {slot_id}")
-                        break
-        # remove processed events
-        s["events"] = [e for e in events if e.get("type")!="candidate_selection"]
-
-        if not s.get("candidate_selection"):
-            s["waiting_for"] = "candidate"
-            s.setdefault("logs",[]).append("WaitCandidate: still waiting (PAUSE)")
-        return s
-
-    def n_scheduler(s:GraphState)->GraphState: return _SCHD.act(s)
-
-    # Pause node: no-op; flow ends here to simulate a pause
-    def n_pause(s:GraphState)->GraphState: return s
-
-    # Nodes
-    builder.add_node("intake", n_intake)
-    builder.add_node("panel_select", n_panel)
-    builder.add_node("compliance", n_compliance)
-    builder.add_node("find_slots", n_availability)
-    builder.add_node("interviewer_comms", n_interviewer_comms)
-    builder.add_node("wait_interviewers", n_wait_interviewers)
-    builder.add_node("candidate_comms", n_candidate_comms)
-    builder.add_node("wait_candidate", n_wait_candidate)
-    builder.add_node("scheduler", n_scheduler)
-    builder.add_node("pause", n_pause)
-
-    # Edges
-    builder.add_edge(START, "intake")
-    builder.add_edge("intake", "panel_select")
-    builder.add_edge("panel_select", "compliance")
-    builder.add_edge("compliance", "find_slots")
-    builder.add_edge("find_slots", "interviewer_comms")
-    builder.add_edge("interviewer_comms", "wait_interviewers")
-
-    # Conditional: wait_interviewers → (pause | candidate_comms)
-    def cond_wait_interviewers(s:GraphState) -> Literal["pause","continue"]:
-        return "continue" if s.get("waiting_for") is None else "pause"
-    builder.add_conditional_edges("wait_interviewers", cond_wait_interviewers, {"pause":"pause","continue":"candidate_comms"})
-
-    builder.add_edge("candidate_comms", "wait_candidate")
-
-    # Conditional: wait_candidate → (pause | scheduler)
-    def cond_wait_candidate(s:GraphState) -> Literal["pause","continue"]:
-        return "continue" if s.get("candidate_selection") else "pause"
-    builder.add_conditional_edges("wait_candidate", cond_wait_candidate, {"pause":"pause","continue":"scheduler"})
-
-    builder.add_edge("scheduler", END)
-    builder.add_edge("pause", END)
-
-    memory = SqliteSaver.from_conn_string(DB_PATH)
-    graph = builder.compile(checkpointer=memory)
-    return graph
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Public API — run, inject events, resume
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _invoke(graph, thread_id:str, state:Optional[GraphState]=None) -> GraphState:
-    cfg = default_cfg()
-    if state is None:
-        state = {"cfg":cfg,"logs":[],"errors":[],"events":[]}
-    out = graph.invoke(state, config={"configurable":{"thread_id": thread_id}})
-    return out
-
-def run_until_pause(thread_id:str="demo-1") -> GraphState:
-    """Starts a new scheduling run and stops at the first pause (waiting for interviewers)."""
-    ensure_dir(OUTBOX_DIR)
-    graph = build_graph()
-    s = _invoke(graph, thread_id)
-    print("Run→Pause @", s.get("waiting_for"))
-    return s
-
-def inject_interviewer_event(thread_id:str, email:str, action:Literal["approve","decline","suggest"]):
-    """Inject a single interviewer response event."""
-    graph = build_graph()
-    # Load current state from checkpoint (graph.invoke with empty dict will load last)
-    s = _invoke(graph, thread_id, state={})
-    ev = {"type":"interviewer_response","email":email,"action":"approve" if action=="approve" else ("decline" if action=="decline" else "suggest")}
-    s.setdefault("events", []).append(ev)
-    # Save back and run the wait node to process; we route through wait_interviewers via interviewer_comms edge already added
-    # Simplest: directly invoke again; conditional node will decide to pause or continue.
-    s = _invoke(graph, thread_id, state=s)
-    print("Injected interviewer event:", ev, "| waiting_for:", s.get("waiting_for"))
-    return s
-
-def resume_until_pause(thread_id:str):
-    """Resume from current pause; will progress until next pause (candidate) or finish if already satisfied."""
-    graph = build_graph()
-    s = _invoke(graph, thread_id, state={})
-    print("Resume→", "Paused @" + str(s.get("waiting_for")) if s.get("waiting_for") else "Continuing")
-    return s
-
-def inject_candidate_event(thread_id:str, slot_id:str):
-    """Inject candidate selection event for a previously offered slot."""
-    graph = build_graph()
-    s = _invoke(graph, thread_id, state={})
-    ev = {"type":"candidate_selection","slot_id":slot_id}
-    s.setdefault("events", []).append(ev)
-    s = _invoke(graph, thread_id, state=s)
-    print("Injected candidate selection:", slot_id, "| waiting_for:", s.get("waiting_for"))
-    return s
-
-def resume_to_finish(thread_id:str):
-    """Resume and try to finish scheduling (schedule meeting + notices)."""
-    return resume_until_pause(thread_id)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Example demo script (run step-by-step)
-# ─────────────────────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    print("Demo: starting run and pausing for interviewer approvals…")
-    s = run_until_pause("t1")  # reaches wait_interviewers → pause
-    # Inspect offered auto slots (optional)
-    autos = s.get("auto_proposed_slots", [])
-    print(f"Auto slots proposed: {len(autos)}")
-    if autos:
-        print("Example slot:", autos[0]["id"], autos[0]["start_iso"], "→", autos[0]["end_iso"])
-
-    # Inject approvals/suggestions from two panelists
-    print("\nInjecting interviewer approvals/suggestions…")
-    inject_interviewer_event("t1", email="rkumar@corp.example", action="approve")
-    inject_interviewer_event("t1", email="siyer@corp.example", action="suggest")
-
-    # Resume — this should proceed past wait_interviewers, send candidate email, then pause at wait_candidate
-    print("\nResuming until candidate pause…")
-    s2 = resume_until_pause("t1")
-    print("Waiting for:", s2.get("waiting_for"))
-    offered = s2.get("candidate_slots_offered", [])
-    if offered:
-        chosen_id = offered[0]["id"]
-        print("\nInjecting candidate selection:", chosen_id)
-        inject_candidate_event("t1", slot_id=chosen_id)
-
-    # Final resume to finish scheduling
-    print("\nFinal resume to finish…")
-    s3 = resume_to_finish("t1")
-    mtg = s3.get("meeting")
-    if mtg:
-        print("Scheduled:", mtg["join_url"], mtg["start_iso"], "→", mtg["end_iso"])
-    if s3.get("errors"):
-        print("Errors:", s3["errors"])
-    print("Logs:")
-    for line in s3.get("logs", []): print(" -", line)
+@app.post("/seed-demo")
+async def seed_demo():
+    async with AsyncSessionLocal() as s:
+        await s.execute(text(
+            "INSERT INTO candidates_view(id, name, email, processed) "
+            "VALUES (:id, :name, :email, FALSE) "
+            "ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, email=EXCLUDED.email, processed=FALSE, updated_at=NOW()"
+        ), {"id": "CAND-001", "name": "Asha Rao", "email": "asha.rao@example.com"})
+        await s.execute(text(
+            "INSERT INTO candidates_view(id, name, email, processed) "
+            "VALUES (:id, :name, :email, FALSE) "
+            "ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, email=EXCLUDED.email, processed=FALSE, updated_at=NOW()"
+        ), {"id": "CAND-002", "name": "Vikram Desai", "email": "vikram.desai@example.com"})
+        await s.commit()
+    return {"ok": True}
